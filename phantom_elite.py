@@ -662,7 +662,7 @@ class Phantom:
         opts.enable_mem_pattern = True
         opts.enable_cpu_mem_arena = True
 
-        providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
+        providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
         self.session = ort.InferenceSession(path, providers=providers, sess_options=opts)
         print(f"APEX v4 | {self.session.get_providers()[0]}")
 
