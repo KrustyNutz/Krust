@@ -154,7 +154,7 @@ REGIME_WEIGHTS = {
         'momentum': 3.0,      # Primary driver in trends
         'trade_flow': 2.0,    # Confirms institutional participation
         'vwap_dev': 0.5,      # Slight penalty for being far from VWAP (overextended)
-        'rsi': 1.0,           # Filter extremes
+        'rsi': 0.0,           # Disabled: -47pp lift on May 7; 10% WR when agreeing
         'obi': 1.5,           # Order book confirmation
         'mtf': 2.5,           # Multi-timeframe agreement is critical
     },
@@ -162,7 +162,7 @@ REGIME_WEIGHTS = {
         'momentum': 0.5,      # Fade momentum in range
         'trade_flow': 1.0,    # Still useful
         'vwap_dev': 3.0,      # Primary driver — fade deviations
-        'rsi': 2.5,           # Oversold/overbought is the signal
+        'rsi': 0.0,           # Disabled: same inversion holds in MEAN_REVERT data
         'obi': 1.0,           # Confirmation
         'mtf': 1.0,           # Less important in range
     },
@@ -180,7 +180,7 @@ REGIME_WEIGHTS = {
 # Higher = more selective = fewer but better signals
 SIGNAL_THRESHOLD = {
     'TRENDING': 5.0,          # Raised from 4.0 — fewer but better signals
-    'MEAN_REVERT': 5.0,       # Require strong confluence for reversals
+    'MEAN_REVERT': 99.0,      # Disabled: 15% WR / -0.023% avg across 13 May 7 signals
     'VOLATILE': 99.0,         # Effectively disabled — don't trade chaos
 }
 
@@ -1169,8 +1169,10 @@ def nexus_loop(ds: DataStream, live: bool = False):
                 # --- News sentiment filter ---
                 # news_agrees: boost confidence (trend confirmation)
                 # news_disagrees + weak score: GATE (counter-trend garbage)
-                # news_disagrees + strong score (7+): allow (legitimate reversal)
-                NEWS_DISAGREE_MIN_SCORE = 7.0
+                # news_disagrees + strong score (8+): allow (legitimate reversal)
+                # Raised from 7.0 to 8.0: May 12 had 2 trades slip past 7.0,
+                # both lost. 7-8 score tier overall is only 50% WR vs 64% for 6-7.
+                NEWS_DISAGREE_MIN_SCORE = 8.0
 
                 if signal in ("CALL", "PUT") and not news_trade:
                     news_vote = news.sentiment_vote(ticker)
