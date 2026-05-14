@@ -120,21 +120,60 @@ def safe_float(s: Optional[str]) -> Optional[float]:
         return None
 
 
-def load_rows(paths: List[str]) -> List[dict]:
+def find_similar(name: str) -> List[str]:
+    """If `name` doesn't exist, search the tree for a file with that basename."""
+    base = os.path.basename(name)
+    hits: List[str] = []
+    for root, _dirs, files in os.walk('.'):
+        if base in files:
+            hits.append(os.path.join(root, base))
+    return hits
+
+
+def resolve_paths(args_paths: List[str]) -> List[str]:
+    """Resolve user-supplied paths; if a path is missing, search for it."""
+    resolved: List[str] = []
+    for p in args_paths:
+        if os.path.exists(p):
+            resolved.append(p)
+            continue
+        candidates = find_similar(p)
+        if candidates:
+            print(f"note: '{p}' not found at that path; using:", file=sys.stderr)
+            for c in candidates:
+                print(f"        {c}", file=sys.stderr)
+            resolved.extend(candidates)
+        else:
+            print(f"warn: '{p}' not found and no file with that name exists "
+                  f"under {os.getcwd()}", file=sys.stderr)
+    return resolved
+
+
+def load_rows(paths: List[str], debug: bool = False) -> List[dict]:
     """Read all outcomes rows from the given CSV paths, with parsed reasons."""
     rows = []
     for path in paths:
         if not os.path.exists(path):
             print(f"warn: missing {path}", file=sys.stderr)
             continue
+        per_file_total = 0
+        per_file_fired = 0
+        per_file_with_pnl = 0
         with open(path, 'r', newline='') as f:
             reader = csv.DictReader(f)
             for raw in reader:
+                per_file_total += 1
                 signal = (raw.get('signal') or '').strip()
                 if signal not in ('CALL', 'PUT'):
                     continue
+                per_file_fired += 1
                 side = signal_dir(signal)
                 regime, score, votes, flags = parse_reason(raw.get('reason', ''))
+                pnl_30 = safe_float(raw.get('pnl_30s_pct'))
+                pnl_60 = safe_float(raw.get('pnl_60s_pct'))
+                pnl_120 = safe_float(raw.get('pnl_120s_pct'))
+                if pnl_120 is not None:
+                    per_file_with_pnl += 1
                 row = {
                     'source': os.path.basename(path),
                     'ticker': raw.get('ticker', ''),
@@ -145,11 +184,20 @@ def load_rows(paths: List[str]) -> List[dict]:
                     'reason': raw.get('reason', ''),
                     'votes': votes,
                     'flags': flags,
-                    'pnl_30s': safe_float(raw.get('pnl_30s_pct')),
-                    'pnl_60s': safe_float(raw.get('pnl_60s_pct')),
-                    'pnl_120s': safe_float(raw.get('pnl_120s_pct')),
+                    'pnl_30s': pnl_30,
+                    'pnl_60s': pnl_60,
+                    'pnl_120s': pnl_120,
                 }
                 rows.append(row)
+        if debug:
+            print(f"  {path}: total_rows={per_file_total}  "
+                  f"fired={per_file_fired}  with_120s_pnl={per_file_with_pnl}",
+                  file=sys.stderr)
+        elif per_file_fired > 0 and per_file_with_pnl == 0:
+            print(f"warn: {path} has {per_file_fired} fired signals but NONE have "
+                  f"completed PnL columns. The bot may have been killed before "
+                  f"flush_completed_outcomes() ran. Try a different date's file.",
+                  file=sys.stderr)
     return rows
 
 
@@ -374,10 +422,19 @@ def print_score_buckets(rows: List[dict], horizon: int):
 
 def discover_paths(args_paths: List[str]) -> List[str]:
     if args_paths:
-        return args_paths
-    paths = sorted(glob.glob('logs/outcomes_*.csv'))
-    paths += sorted(glob.glob('logs/crypto/outcomes_*.csv'))
-    return paths
+        return resolve_paths(args_paths)
+    # Recursive: covers logs/, logs/nexus/, logs/crypto/, or any nested layout.
+    paths = sorted(glob.glob('logs/**/outcomes_*.csv', recursive=True))
+    paths += sorted(glob.glob('logs/outcomes_*.csv'))
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for p in paths:
+        np = os.path.normpath(p)
+        if np not in seen:
+            seen.add(np)
+            unique.append(np)
+    return unique
 
 
 def main():
@@ -391,15 +448,21 @@ def main():
                     help='Filter to one regime (TRENDING / MEAN_REVERT / VOLATILE)')
     ap.add_argument('--ticker', default=None,
                     help='Filter to one ticker symbol')
+    ap.add_argument('--debug', action='store_true',
+                    help='Print per-file row counts and parse stats')
     args = ap.parse_args()
 
     paths = discover_paths(args.paths)
     if not paths:
-        print("No outcomes CSVs found. Pass paths or run from a directory that "
-              "contains logs/outcomes_*.csv.")
+        print("No outcomes CSVs found. Searched:")
+        print("  ./logs/**/outcomes_*.csv  (recursive)")
+        print(f"Current dir: {os.getcwd()}")
+        print("Pass an explicit path, or run from the directory containing logs/.")
         sys.exit(1)
 
-    rows = load_rows(paths)
+    if args.debug:
+        print("Discovered files:", file=sys.stderr)
+    rows = load_rows(paths, debug=args.debug)
     if args.regime:
         rows = [r for r in rows if r['regime'] == args.regime]
     if args.ticker:
