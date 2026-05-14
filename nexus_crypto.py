@@ -119,7 +119,7 @@ WARMUP_SECONDS = 180            # 3 min warmup (crypto needs more data)
 
 SIGNAL_THRESHOLD = {
     'TRENDING': 5.0,
-    'MEAN_REVERT': 5.5,
+    'MEAN_REVERT': 99.0,    # Disabled: extrapolated from equity (15% WR, -0.023% avg)
     'VOLATILE': 99.0,
 }
 
@@ -128,7 +128,7 @@ REGIME_WEIGHTS = {
         'momentum': 3.0,
         'trade_flow': 2.0,
         'vwap_dev': 0.5,
-        'rsi': 1.0,
+        'rsi': 0.0,           # Disabled: equity showed -34pp lift / 10% WR when agreeing
         'obi': 1.0,           # Crypto OBI is noisier — lower weight
         'mtf': 2.5,
     },
@@ -136,7 +136,7 @@ REGIME_WEIGHTS = {
         'momentum': 0.5,
         'trade_flow': 1.0,
         'vwap_dev': 3.0,
-        'rsi': 2.5,
+        'rsi': 0.0,           # Disabled with the regime; revisit if MEAN_REVERT is re-enabled
         'obi': 0.5,
         'mtf': 1.0,
     },
@@ -967,7 +967,9 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
                 )
 
                 # --- News sentiment filter ---
-                NEWS_DISAGREE_MIN_SCORE = 7.0
+                # Raised from 7.0 to 8.0 to match equity tuning. Equity 7-8 tier
+                # was 50% WR vs 64% for 6-7, so 7.0 isn't a meaningful inflection.
+                NEWS_DISAGREE_MIN_SCORE = 8.0
                 if signal in ("CALL", "PUT"):
                     news_vote = news.sentiment_vote()
                     if news_vote != 0:
