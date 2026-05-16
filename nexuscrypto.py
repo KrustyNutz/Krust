@@ -23,6 +23,7 @@ import time
 import asyncio
 import sys
 import os
+import re
 import math
 import logging
 import argparse
@@ -37,12 +38,15 @@ try:
 except ImportError:
     pass
 
+# alpaca-trade-api is in maintenance mode; crypto support is brittle.
+# If orders/news fail, migrate to alpaca-py.
 from alpaca_trade_api.rest import REST
 
 try:
     import websocket as ws_lib
 except ImportError:
-    log.error("Missing websocket-client: pip install websocket-client")
+    # `log` is not initialised yet — use stderr so this surfaces.
+    print("ERROR: Missing websocket-client: pip install websocket-client", file=sys.stderr)
     sys.exit(1)
 
 try:
@@ -95,22 +99,39 @@ HIGH_VOL_WINDOWS = [
 ]
 REQUIRE_HIGH_VOL = False  # Set True to only trade during peak windows
 
+
+def in_high_vol_window(now_utc: datetime) -> bool:
+    minutes = now_utc.hour * 60 + now_utc.minute
+    for (sh, sm, eh, em) in HIGH_VOL_WINDOWS:
+        start = sh * 60 + sm
+        end = eh * 60 + em
+        if start <= minutes < end:
+            return True
+    return False
+
 # --- Risk Parameters ---
 MAX_SESSION_LOSS = 500.00       # Tighter for crypto volatility
 SIGNAL_COOLDOWN_SEC = 180       # 3 min between signals (crypto trends longer)
-MAX_SPREAD_PCT = 0.05           # Crypto spreads are wider than equities
+# Spread is stored as a fraction (e.g. 0.001 = 10 bps). 10 bps is wide for BTC
+# in normal markets — anything past this means dislocated/illiquid book.
+MAX_SPREAD_FRACTION = 0.001
 MAX_OPEN_POSITIONS = 2
 
 # --- Position Sizing (fractional) ---
 BTC_BASE_QTY = 0.002            # ~$200 at $100k BTC
 ETH_BASE_QTY = 0.05             # ~$200 at $4k ETH
+BTC_MIN_QTY = 0.0001            # Alpaca crypto minimums
+ETH_MIN_QTY = 0.001
 MAX_QTY_MULTIPLIER = 3.0        # High-confidence = up to 3x base
+QTY_CONFIDENCE_MULT = 3.0       # Multiplier applied to confidence before capping
 
 # --- Stop Parameters (% based, MUCH wider than equities) ---
 TRAILING_STOP_PCT = 0.25        # 0.25% trailing (vs 0.10% for SPY)
 HARD_STOP_PCT = 0.50            # 0.50% max loss per trade
 MAX_HOLD_SECONDS = 600          # 10 min max hold (crypto trends longer)
-WASH_TRADE_COOLDOWN = 60        # 60s cooldown after closing (crypto needs more)
+# Cooldown to avoid immediate reentry after a stop-out (crypto != securities,
+# so this is not an IRS wash-sale concern — just trade-flow hygiene).
+REENTRY_COOLDOWN = 60
 
 # --- Signal Thresholds ---
 # Crypto needs different thresholds because volatility is structurally higher
@@ -185,31 +206,35 @@ BEARISH_WORDS = {
 # ====================================================================
 # SHARED GUI STATE
 # ====================================================================
+def _empty_ticker_state() -> dict:
+    return {'price': 0, 'smooth': 0, 'vwap': 0, 'z_score': 0,
+            'velocity': 0, 'accel': 0, 'rsi': 50, 'obi': 0,
+            'spread': 0, 'regime': '---', 'vol_ratio': 0,
+            'net_flow': 0, 'confidence': 0, 'votes': {},
+            'bar5s': 0, 'bar30s': 0, 'bar5m': 0,
+            'last_signal': 'NONE', 'last_active_signal': 'NONE'}
+
+
 gui_state = {
     'equity': 0.0, 'session_pnl': 0.0, 'mode': 'OBSERVE',
-    'status': 'INITIALIZING...', 'signal_counts': {'CALL': 0, 'PUT': 0, 'NONE': 0},
-    'tickers': {
-        'BTCUSD': {'price': 0, 'smooth': 0, 'vwap': 0, 'z_score': 0,
-                   'velocity': 0, 'accel': 0, 'rsi': 50, 'obi': 0,
-                   'spread': 0, 'regime': '---', 'vol_ratio': 0,
-                   'net_flow': 0, 'confidence': 0, 'votes': {},
-                   'bar5s': 0, 'bar30s': 0, 'bar5m': 0, 'last_signal': 'NONE'},
-        'ETHUSD': {'price': 0, 'smooth': 0, 'vwap': 0, 'z_score': 0,
-                   'velocity': 0, 'accel': 0, 'rsi': 50, 'obi': 0,
-                   'spread': 0, 'regime': '---', 'vol_ratio': 0,
-                   'net_flow': 0, 'confidence': 0, 'votes': {},
-                   'bar5s': 0, 'bar30s': 0, 'bar5m': 0, 'last_signal': 'NONE'},
-    },
-    'trade_log': [], 'positions': {}, 'outcomes': {}, 'news': {},
+    'status': 'INITIALIZING...',
+    'signal_counts': {'CALL': 0, 'PUT': 0, 'NONE': 0, 'GATED': 0},
+    'tickers': {t: _empty_ticker_state() for t in WATCHLIST},
+    'trade_log': deque(maxlen=15),
+    'positions': {}, 'outcomes': {}, 'news': {},
 }
+
+# Thread-safety: gui_log() runs on the worker thread, update_gui() on the
+# Tk main thread. Mutating a list while another thread iterates raises
+# RuntimeError; the lock + deque + snapshot in update_gui closes that race.
+_gui_lock = threading.Lock()
 
 
 def gui_log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
-    gui_state['trade_log'].insert(0, entry)
-    if len(gui_state['trade_log']) > 15:
-        gui_state['trade_log'].pop()
+    with _gui_lock:
+        gui_state['trade_log'].appendleft(entry)
 
 
 # ====================================================================
@@ -225,10 +250,11 @@ class BarAggregator:
         self._current_low = math.inf
         self._current_close = 0.0
         self._current_ticks = 0
-        self._current_cum_pv = 0.0
+        self._current_cum_pv = 0.0   # Σ(price · size)
+        self._current_cum_v = 0.0    # Σ(size)
         self._bar_start = 0.0
 
-    def tick(self, price: float, now: float):
+    def tick(self, price: float, now: float, size: float = 1.0):
         if self._bar_start == 0:
             self._bar_start = now
         if self._current_open == 0:
@@ -237,13 +263,18 @@ class BarAggregator:
         self._current_low = min(self._current_low, price)
         self._current_close = price
         self._current_ticks += 1
-        self._current_cum_pv += price
+        # Real VWAP needs trade size. If callers pass size=1 it degrades to
+        # the previous mean-price behaviour without breaking anything.
+        self._current_cum_pv += price * size
+        self._current_cum_v += size
         if (now - self._bar_start) >= self.period and self._current_ticks > 0:
+            vwap = (self._current_cum_pv / self._current_cum_v
+                    if self._current_cum_v > 0 else self._current_close)
             bar = {
                 'open': self._current_open, 'high': self._current_high,
                 'low': self._current_low, 'close': self._current_close,
                 'ticks': self._current_ticks,
-                'vwap': self._current_cum_pv / self._current_ticks,
+                'vwap': vwap,
                 'range_pct': ((self._current_high - self._current_low) /
                               self._current_low * 100) if self._current_low > 0 else 0,
                 'time': now,
@@ -254,6 +285,7 @@ class BarAggregator:
             self._current_low = math.inf
             self._current_ticks = 0
             self._current_cum_pv = 0.0
+            self._current_cum_v = 0.0
             self._bar_start = now
             return bar
         return None
@@ -289,9 +321,11 @@ class RollingVWAP:
 
     def update(self, price: float):
         self.prices.append(price)
-        if len(self.prices) > 10:
-            self.vwap = sum(self.prices) / len(self.prices)
-            variance = sum((p - self.vwap) ** 2 for p in self.prices) / len(self.prices)
+        n = len(self.prices)
+        if n > 10:
+            self.vwap = sum(self.prices) / n
+            # Sample variance (n-1) to match RegimeDetector._stdev.
+            variance = sum((p - self.vwap) ** 2 for p in self.prices) / (n - 1)
             self.std = math.sqrt(max(variance, 0.0))
 
     def z_score(self, price: float) -> float:
@@ -401,8 +435,10 @@ class RegimeDetector:
         return self.regime
 
     @staticmethod
-    def _stdev(data: list, window: int) -> float:
-        if len(data) < max(window, 5):
+    def _stdev(data: list, window: int, min_sample: int = 30) -> float:
+        # Return a partial estimate once min_sample is hit so vol_ratio
+        # doesn't snap from 1.0 → real-value the instant the full window fills.
+        if len(data) < min_sample:
             return 0.0
         subset = data[-window:]
         if len(subset) < 2:
@@ -484,7 +520,7 @@ def compute_composite_signal(votes, regime, spread, vol_ratio):
         max_possible += abs(w)
         if vote != 0:
             components.append(f"{name}={vote:+d}")
-    spread_penalty = min((spread / MAX_SPREAD_PCT) * 0.3, 0.3)
+    spread_penalty = min((spread / MAX_SPREAD_FRACTION) * 0.3, 0.3)
     adjusted_score = raw_score * (1.0 - spread_penalty)
     if vol_ratio > 1.5:
         adjusted_score *= (1.0 / vol_ratio)
@@ -509,7 +545,10 @@ CRYPTO_WS_URL = "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
 
 class CryptoDataStream:
     def __init__(self):
-        self.market_data = {t: {'p': 0.0, 'spread': 0.0, 'obi': 0.0} for t in WATCHLIST}
+        self.market_data = {
+            t: {'p': 0.0, 's': 0.0, 'spread': 0.0, 'obi': 0.0}
+            for t in WATCHLIST
+        }
         self._connected = False
         self._ws = None
 
@@ -557,6 +596,7 @@ class CryptoDataStream:
                 ticker = REVERSE_SYMBOLS.get(stream_sym, "")
                 if ticker and ticker in self.market_data:
                     self.market_data[ticker]['p'] = float(msg.get("p", 0))
+                    self.market_data[ticker]['s'] = float(msg.get("s", 0))
 
             elif msg_type == "q":  # Quote
                 stream_sym = msg.get("S", "")
@@ -612,9 +652,26 @@ class CryptoExecutionEngine:
         except Exception:
             self.start_equity = 50000.0
         self.session_pnl = 0.0
+        self.realized_pnl = 0.0           # local tally, refreshed by sync()
         self.last_signal_time: Dict[str, float] = {}
         self.open_trades: Dict[str, dict] = {}
-        self.last_close_time: Dict[str, float] = {}  # wash trade prevention
+        self.last_close_time: Dict[str, float] = {}
+
+    def _close_managed_positions(self):
+        """Close only positions this bot opened — never the whole account."""
+        for ticker in list(self.open_trades.keys()):
+            trade = self.open_trades[ticker]
+            close_side = 'sell' if trade['order_side'] == 'buy' else 'buy'
+            order_symbol = STREAM_SYMBOLS.get(ticker, ticker)
+            for sym in (order_symbol, ticker):
+                try:
+                    self.api.submit_order(
+                        symbol=sym, qty=trade['qty'], side=close_side,
+                        type='market', time_in_force='gtc',
+                    )
+                    break
+                except Exception as e:
+                    log.error(f"Kill-switch close failed for {sym}: {e}")
 
     def sync(self):
         try:
@@ -622,21 +679,29 @@ class CryptoExecutionEngine:
             equity = float(acc.equity)
             self.session_pnl = equity - self.start_equity
             if self.session_pnl < -MAX_SESSION_LOSS:
-                log.critical(f"MAX LOSS: ${self.session_pnl:.2f}")
+                log.critical(f"MAX LOSS: ${self.session_pnl:.2f} — flattening managed positions")
                 if self.live:
-                    self.api.close_all_positions()
-                sys.exit(1)
+                    self._close_managed_positions()
+                # sys.exit() from a daemon thread is a no-op; os._exit kills
+                # the whole process so the GUI doesn't keep running blind.
+                os._exit(1)
         except Exception as e:
             log.debug(f"Account sync: {e}")
             return
 
-        # Position sync (may fail if no crypto positions)
+        # Position sync — filter to our watchlist so unrelated account
+        # holdings (equities, other coins) don't leak into the GUI.
         try:
             positions = self.api.list_positions()
             pos_dict = {}
             for p in positions:
                 try:
-                    pos_dict[p.symbol] = {
+                    sym = p.symbol
+                    # Alpaca may report either 'BTCUSD' or 'BTC/USD'
+                    canonical = REVERSE_SYMBOLS.get(sym, sym)
+                    if canonical not in WATCHLIST:
+                        continue
+                    pos_dict[canonical] = {
                         'gain': float(p.unrealized_plpc) * 100,
                         'pnl': float(p.unrealized_pl),
                         'qty': float(p.qty),
@@ -647,19 +712,21 @@ class CryptoExecutionEngine:
         except Exception as e:
             log.debug(f"Position sync: {e}")
 
-    def can_signal(self, ticker: str, now: float) -> bool:
+    def can_signal(self, ticker: str, now: float) -> tuple[bool, str]:
+        """Returns (allowed, reason_if_blocked)."""
         last = self.last_signal_time.get(ticker, 0)
         if (now - last) < SIGNAL_COOLDOWN_SEC:
-            return False
+            return False, "cooldown"
         if len(self.open_trades) >= MAX_OPEN_POSITIONS:
-            return False
+            return False, "max_positions"
         if ticker in self.open_trades:
-            return False
-        # Wash trade prevention
+            return False, "already_open"
         last_close = self.last_close_time.get(ticker, 0)
-        if (now - last_close) < WASH_TRADE_COOLDOWN:
-            return False
-        return True
+        if (now - last_close) < REENTRY_COOLDOWN:
+            return False, "reentry_cooldown"
+        if REQUIRE_HIGH_VOL and not in_high_vol_window(datetime.utcnow()):
+            return False, "outside_vol_window"
+        return True, ""
 
     def manage_positions(self, ticker: str, current_price: float, now: float):
         if ticker not in self.open_trades:
@@ -702,77 +769,85 @@ class CryptoExecutionEngine:
         self.last_signal_time[ticker] = now
         if not self.live:
             return
-        if spread > MAX_SPREAD_PCT:
+        if spread > MAX_SPREAD_FRACTION:
             return
         if ticker in self.open_trades:
             return
-        # Fractional sizing
+
+        # Fractional sizing — capped by MAX_QTY_MULTIPLIER, floored at
+        # exchange minimum so low-confidence signals don't generate
+        # silently-rejected sub-minimum orders.
         base = BTC_BASE_QTY if "BTC" in ticker else ETH_BASE_QTY
-        qty = round(base * min(confidence * 2, MAX_QTY_MULTIPLIER), 6)
+        minimum = BTC_MIN_QTY if "BTC" in ticker else ETH_MIN_QTY
+        raw_mult = min(confidence * QTY_CONFIDENCE_MULT, MAX_QTY_MULTIPLIER)
+        qty = max(round(base * raw_mult, 6), minimum)
+
         order_side = 'buy' if side == "CALL" else 'sell'
-        # Use BTC/USD format for orders (current Alpaca coin pair format)
         order_symbol = STREAM_SYMBOLS.get(ticker, ticker)
-        try:
+
+        def _submit(sym):
             self.api.submit_order(
-                symbol=order_symbol, qty=qty, side=order_side,
-                type='market', time_in_force='gtc'
+                symbol=sym, qty=qty, side=order_side,
+                type='market', time_in_force='gtc',
             )
-            self.open_trades[ticker] = {
-                'side': side, 'entry': price, 'qty': qty,
-                'time': now, 'peak': 0.0, 'order_side': order_side,
-                'confidence': confidence,
-            }
-            name = DISPLAY_NAMES.get(ticker, ticker)
-            log.info(f"CRYPTO: {order_side.upper()} {qty} {name} @ ${price:,.2f}")
-            gui_log(f"ENTRY: {qty} {name} {side} @ ${price:,.2f}")
-        except Exception as e:
-            log.error(f"Crypto order failed: {e}")
-            # Try with old symbol format as fallback
-            if "/" in order_symbol:
-                try:
-                    self.api.submit_order(
-                        symbol=ticker, qty=qty, side=order_side,
-                        type='market', time_in_force='gtc'
-                    )
-                    self.open_trades[ticker] = {
-                        'side': side, 'entry': price, 'qty': qty,
-                        'time': now, 'peak': 0.0, 'order_side': order_side,
-                        'confidence': confidence,
-                    }
-                    name = DISPLAY_NAMES.get(ticker, ticker)
-                    log.info(f"CRYPTO (fallback): {order_side.upper()} {qty} {name} @ ${price:,.2f}")
-                except Exception as e2:
-                    log.error(f"Crypto order fallback also failed: {e2}")
+
+        for attempt_sym in (order_symbol, ticker):
+            try:
+                _submit(attempt_sym)
+                self.open_trades[ticker] = {
+                    'side': side, 'entry': price, 'qty': qty,
+                    'time': now, 'peak': 0.0, 'order_side': order_side,
+                    'confidence': confidence,
+                }
+                name = DISPLAY_NAMES.get(ticker, ticker)
+                log.info(f"CRYPTO: {order_side.upper()} {qty} {name} @ ${price:,.2f}")
+                gui_log(f"ENTRY: {qty} {name} {side} @ ${price:,.2f}")
+                return
+            except Exception as e:
+                log.error(f"Crypto order failed for {attempt_sym}: {e}")
+                if attempt_sym == ticker:  # last attempt
+                    return
 
     def _close_position(self, ticker: str, reason: str, pnl_pct: float):
         if ticker not in self.open_trades:
             return
         trade = self.open_trades[ticker]
-        self.last_close_time[ticker] = time.time()  # wash trade prevention
+        self.last_close_time[ticker] = time.time()
+
+        # Local realized-PnL tally so the GUI doesn't show stale equity for
+        # the second between close and next account sync.
+        notional = trade['entry'] * trade['qty']
+        realized = notional * (pnl_pct / 100.0)
+        self.realized_pnl += realized
+        self.session_pnl += realized
+
         if not self.live:
             del self.open_trades[ticker]
             return
-        try:
-            close_side = 'sell' if trade['order_side'] == 'buy' else 'buy'
-            order_symbol = STREAM_SYMBOLS.get(ticker, ticker)
+
+        close_side = 'sell' if trade['order_side'] == 'buy' else 'buy'
+        order_symbol = STREAM_SYMBOLS.get(ticker, ticker)
+        closed = False
+        for attempt_sym in (order_symbol, ticker):
             try:
                 self.api.submit_order(
-                    symbol=order_symbol, qty=trade['qty'], side=close_side,
-                    type='market', time_in_force='gtc'
+                    symbol=attempt_sym, qty=trade['qty'], side=close_side,
+                    type='market', time_in_force='gtc',
                 )
-            except Exception:
-                # Fallback to old symbol format
-                self.api.submit_order(
-                    symbol=ticker, qty=trade['qty'], side=close_side,
-                    type='market', time_in_force='gtc'
-                )
-            result = "WIN" if pnl_pct > 0 else "LOSS"
-            name = DISPLAY_NAMES.get(ticker, ticker)
+                closed = True
+                break
+            except Exception as e:
+                log.error(f"Close failed for {attempt_sym}: {e}")
+
+        result = "WIN" if pnl_pct > 0 else "LOSS"
+        name = DISPLAY_NAMES.get(ticker, ticker)
+        if closed:
             log.info(f"CLOSED: {name} {reason} | {result} {pnl_pct:+.3f}%")
             gui_log(f"EXIT: {name} {result} {pnl_pct:+.3f}% ({reason})")
-            del self.open_trades[ticker]
-        except Exception as e:
-            log.error(f"Close failed for {ticker}: {e}")
+        else:
+            log.critical(f"COULD NOT CLOSE {name} — position still open on exchange!")
+            gui_log(f"!! CLOSE FAILED {name} — manual intervention")
+        del self.open_trades[ticker]
 
 
 # ====================================================================
@@ -799,8 +874,6 @@ class CryptoTickerState:
 # ====================================================================
 # NEWS (simplified inline — crypto-specific)
 # ====================================================================
-import re
-
 class CryptoNewsEngine:
     def __init__(self, api, poll_interval: int = 120):
         self.api = api
@@ -811,20 +884,26 @@ class CryptoNewsEngine:
         self.halt_until: float = 0
         self.halt_reason: str = ""
         self.latest: str = ""
+        self._api_unavailable = False  # so we only warn once
 
     def poll(self, now: float):
         if (now - self.last_poll) < self.poll_interval:
             return
         self.last_poll = now
+        if self._api_unavailable:
+            return
         try:
-            # Try multiple symbol formats
             try:
                 news = self.api.get_news("BTC/USD,ETH/USD", limit=5)
             except Exception:
                 try:
                     news = self.api.get_news("BTCUSD,ETHUSD", limit=5)
-                except Exception:
-                    # If news API fails entirely, just skip
+                except Exception as e:
+                    log.warning(
+                        f"News API unavailable for crypto symbols ({e}); "
+                        f"sentiment filter disabled for this session."
+                    )
+                    self._api_unavailable = True
                     return
             for item in news:
                 headline = getattr(item, 'headline', '') or ''
@@ -885,9 +964,13 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
     states = {t: CryptoTickerState(t) for t in WATCHLIST}
     news = CryptoNewsEngine(engine.api)
 
-    warmup_ticks = 0
+    # Wall-clock warmup so a slow/empty stream on one ticker can't stretch
+    # warmup arbitrarily (or skip it entirely).
+    warmup_start = time.time()
     last_flush = time.time()
-    signal_counts = {'CALL': 0, 'PUT': 0, 'NONE': 0}
+    # Pre-gating tally: CALL/PUT/NONE = what the composite voted; GATED =
+    # would-have-been signals that gating suppressed.
+    signal_counts = {'CALL': 0, 'PUT': 0, 'NONE': 0, 'GATED': 0}
     all_outcomes = []
 
     mode_str = "LIVE" if live else "OBSERVE"
@@ -908,9 +991,17 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
             if news_halt:
                 gui_state['status'] = f"NEWS HALT: {news_halt}"
 
+            warmup_elapsed = now - warmup_start
+            warming_up = warmup_elapsed < WARMUP_SECONDS
+            if warming_up:
+                gui_state['status'] = f"WARMING UP ({int(WARMUP_SECONDS - warmup_elapsed)}s)"
+            elif not news_halt:
+                gui_state['status'] = f"CRYPTO {'LIVE' if live else 'OBSERVING'}"
+
             for ticker in WATCHLIST:
                 data = ds.market_data[ticker]
                 raw_price = data['p']
+                trade_size = data.get('s', 1.0) or 1.0
                 spread = data['spread']
                 obi = data['obi']
                 if raw_price == 0:
@@ -932,19 +1023,14 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
                 st.vwap.update(raw_price)
                 st.trade_flow.classify_tick(raw_price)
                 st.rsi.update(raw_price)
-                st.bars_5s.tick(raw_price, now)
-                st.bars_30s.tick(raw_price, now)
-                st.bars_5m.tick(raw_price, now)
+                st.bars_5s.tick(raw_price, now, size=trade_size)
+                st.bars_30s.tick(raw_price, now, size=trade_size)
+                st.bars_5m.tick(raw_price, now, size=trade_size)
 
                 sig_logger.update_outcomes(ticker, raw_price, now)
 
-                warmup_ticks += 1
-                if warmup_ticks < WARMUP_SECONDS * len(WATCHLIST):
-                    remaining = WARMUP_SECONDS - (warmup_ticks // len(WATCHLIST))
-                    gui_state['status'] = f"WARMING UP ({remaining}s)"
+                if warming_up:
                     continue
-
-                gui_state['status'] = f"CRYPTO {'LIVE' if live else 'OBSERVING'}"
 
                 bar5s_dir = st.bars_5s.direction(3)
                 bar30s_dir = st.bars_30s.direction(3)
@@ -984,19 +1070,28 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
                                 signal = "NONE"
                                 reason += f" | GATED:news_disagrees(score={abs(raw_score):.1f}<{NEWS_DISAGREE_MIN_SCORE})"
 
-                # Gating
+                # Gating — track pre-gating intent separately so NONE in
+                # signal_counts means "composite voted NONE", not
+                # "voted CALL but got blocked".
+                gated_reason = None
                 if signal != "NONE":
                     if news_halt:
-                        signal = "NONE"
-                        reason += f" | GATED:news({news_halt[:30]})"
-                    elif not engine.can_signal(ticker, now):
-                        signal = "NONE"
-                        reason += " | GATED:cooldown"
-                    elif spread > MAX_SPREAD_PCT:
-                        signal = "NONE"
-                        reason += f" | GATED:spread({spread*100:.3f}%)"
+                        gated_reason = f"news({news_halt[:30]})"
+                    elif spread > MAX_SPREAD_FRACTION:
+                        gated_reason = f"spread({spread*100:.3f}%)"
+                    else:
+                        allowed, block_reason = engine.can_signal(ticker, now)
+                        if not allowed:
+                            gated_reason = block_reason
 
-                signal_counts[signal] += 1
+                    if gated_reason:
+                        reason += f" | GATED:{gated_reason}"
+                        signal_counts['GATED'] += 1
+                        signal = "NONE"
+                    else:
+                        signal_counts[signal] += 1
+                else:
+                    signal_counts['NONE'] += 1
 
                 # Update GUI
                 gui_state['signal_counts'] = dict(signal_counts)
@@ -1021,8 +1116,8 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
                 td['bar30s'] = round(bar30s_dir, 2)
                 td['bar5m'] = round(bar5m_dir, 2)
                 td['last_signal'] = signal
-
                 if signal in ("CALL", "PUT"):
+                    td['last_active_signal'] = signal
                     name = DISPLAY_NAMES.get(ticker, ticker)
                     gui_log(f"{signal} {name} conf={confidence:.2f} [{current_regime}]")
 
@@ -1048,7 +1143,13 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
 
             # Periodic flush
             if now - last_flush > 30:
-                for event in sig_logger._fired_buffer:
+                # Prefer a public iterator on SignalLogger; fall back to the
+                # private buffer if the module hasn't been updated to expose one.
+                if hasattr(sig_logger, 'iter_pending_outcomes'):
+                    pending = sig_logger.iter_pending_outcomes()
+                else:
+                    pending = getattr(sig_logger, '_fired_buffer', [])
+                for event in pending:
                     if event.pnl_120s_pct is not None:
                         if not any(abs(o[0] - event.timestamp) < 0.01 for o in all_outcomes):
                             all_outcomes.append((event.timestamp, event.pnl_120s_pct, event.signal))
@@ -1068,12 +1169,21 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
                     }
 
                 sc = signal_counts
-                log.info(f"[STATUS] {sc['CALL']}C/{sc['PUT']}P/{sc['NONE']}skip | "
-                         f"PnL=${engine.session_pnl:+.2f} | "
-                         f"BTC=${ds.market_data['BTCUSD']['p']:,.2f} "
-                         f"ETH=${ds.market_data['ETHUSD']['p']:,.2f} | "
-                         f"Regimes: BTC={states['BTCUSD'].regime.regime} "
-                         f"ETH={states['ETHUSD'].regime.regime}")
+                # Status line iterates WATCHLIST so adding a symbol doesn't
+                # break the f-string with a KeyError.
+                px_str = " ".join(
+                    f"{DISPLAY_NAMES.get(t, t)}=${ds.market_data[t]['p']:,.2f}"
+                    for t in WATCHLIST
+                )
+                rg_str = " ".join(
+                    f"{DISPLAY_NAMES.get(t, t)}={states[t].regime.regime}"
+                    for t in WATCHLIST
+                )
+                log.info(
+                    f"[STATUS] {sc['CALL']}C/{sc['PUT']}P/{sc['NONE']}none/"
+                    f"{sc['GATED']}gated | PnL=${engine.session_pnl:+.2f} | "
+                    f"{px_str} | Regimes: {rg_str}"
+                )
 
             time.sleep(1)
 
@@ -1081,10 +1191,8 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
         log.info("Shutting down crypto NEXUS...")
         sig_logger.close()
         if live:
-            try:
-                engine.api.close_all_positions()
-            except Exception:
-                pass
+            # Close only positions this bot opened, not the entire account.
+            engine._close_managed_positions()
         sys.exit(0)
 
 
@@ -1198,7 +1306,8 @@ class CryptoGUI:
 
         sc = gui_state['signal_counts']
         self.lbl_signals.config(
-            text=f"Signals: {sc.get('CALL',0)}C / {sc.get('PUT',0)}P / {sc.get('NONE',0)} skip")
+            text=f"Signals: {sc.get('CALL',0)}C / {sc.get('PUT',0)}P / "
+                 f"{sc.get('NONE',0)} none / {sc.get('GATED',0)} gated")
 
         oc = gui_state.get('outcomes', {})
         if oc.get('count', 0) > 0:
@@ -1219,9 +1328,7 @@ class CryptoGUI:
         for ticker in WATCHLIST:
             td = gui_state['tickers'].get(ticker, {})
             p = self.ticker_panels[ticker]
-            is_btc = "BTC" in ticker
-            fmt = f"${td.get('price', 0):,.2f}" if is_btc else f"${td.get('price', 0):,.2f}"
-            p['lbl_price'].config(text=fmt)
+            p['lbl_price'].config(text=f"${td.get('price', 0):,.2f}")
             regime = td.get('regime', '---')
             p['lbl_regime'].config(text=regime, fg=self.regime_colors.get(regime, self.dim))
             z = td.get('z_score', 0)
@@ -1238,7 +1345,9 @@ class CryptoGUI:
             votes = td.get('votes', {})
             if votes:
                 vote_text = "  ".join(f"{n[:4]}:{v:+d}" for n, v in votes.items())
-                sig = td.get('last_signal', 'NONE')
+                # Show the most recent non-NONE signal so it doesn't flash
+                # off on the next tick.
+                sig = td.get('last_active_signal', 'NONE')
                 conf = td.get('confidence', 0)
                 sig_col = self.green if sig == "CALL" else (self.red if sig == "PUT" else self.dim)
                 p['lbl_votes'].config(text=f"[{vote_text}] -> {sig} ({conf:.0%})", fg=sig_col)
@@ -1259,7 +1368,11 @@ class CryptoGUI:
 
         for w in self.log_frame.winfo_children():
             w.destroy()
-        for entry in gui_state.get('trade_log', []):
+        # Snapshot under the lock so we don't iterate a deque the worker
+        # thread is concurrently mutating.
+        with _gui_lock:
+            log_snapshot = list(gui_state.get('trade_log', []))
+        for entry in log_snapshot:
             col = self.cyan
             if "CALL" in entry:
                 col = self.green
