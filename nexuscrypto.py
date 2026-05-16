@@ -1143,13 +1143,7 @@ def crypto_loop(ds: CryptoDataStream, live: bool = False):
 
             # Periodic flush
             if now - last_flush > 30:
-                # Prefer a public iterator on SignalLogger; fall back to the
-                # private buffer if the module hasn't been updated to expose one.
-                if hasattr(sig_logger, 'iter_pending_outcomes'):
-                    pending = sig_logger.iter_pending_outcomes()
-                else:
-                    pending = getattr(sig_logger, '_fired_buffer', [])
-                for event in pending:
+                for event in sig_logger.iter_pending_outcomes():
                     if event.pnl_120s_pct is not None:
                         if not any(abs(o[0] - event.timestamp) < 0.01 for o in all_outcomes):
                             all_outcomes.append((event.timestamp, event.pnl_120s_pct, event.signal))

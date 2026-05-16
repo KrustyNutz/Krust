@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 from collections import deque
 
-logger = logging.getLogger("excalibur.signals")
+logger = logging.getLogger("nexus.signals")
 
 
 @dataclass
@@ -149,6 +149,8 @@ class SignalLogger:
                 token=config['token'],
                 org=config['org'],
             )
+            # SYNCHRONOUS is the right default for low-volume signal writes;
+            # async batching would risk losing the tail on crash.
             self._influx_write = client.write_api(write_options=SYNCHRONOUS)
             self._influx_bucket = config['bucket']
             self._influx_org = config['org']
@@ -174,6 +176,13 @@ class SignalLogger:
     def update_outcomes(self, ticker: str, current_price: float, now: float):
         """Call every tick to check if any pending outcomes are ready."""
         self.outcome_tracker.check_outcomes(ticker, current_price, now)
+
+    def iter_pending_outcomes(self):
+        """
+        Iterate fired signals awaiting (or now holding) outcome backfill.
+        Public API so callers don't reach into _fired_buffer.
+        """
+        return tuple(self._fired_buffer)
 
     def flush_completed_outcomes(self):
         """

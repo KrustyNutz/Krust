@@ -31,6 +31,10 @@ class LowPassFilter:
     def value(self) -> float:
         return self._y
 
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
     def reset(self):
         self._initialized = False
         self._y = 0.0
@@ -84,8 +88,9 @@ class OneEuroFilter:
             self._freq = 1.0 / (timestamp - self._last_time)
         self._last_time = timestamp
 
-        # Estimate derivative
-        prev = self._x_filt.value if self._x_filt._initialized else x
+        # Estimate derivative — use public is_initialized rather than
+        # reaching into the LowPassFilter's private attribute.
+        prev = self._x_filt.value if self._x_filt.is_initialized else x
         dx = (x - prev) * self._freq if self._freq > 0 else 0.0
 
         # Filter the derivative
@@ -102,6 +107,9 @@ class OneEuroFilter:
         self._x_filt.reset()
         self._dx_filt.reset()
         self._last_time = 0.0
+        # Without this, the first post-reset call would use whatever freq
+        # the filter had been running at before — surprising behaviour.
+        self._freq = 1.0
 
     @property
     def value(self) -> float:
