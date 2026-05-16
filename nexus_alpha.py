@@ -1,63 +1,49 @@
 from __future__ import annotations
 
 # ====================================================================
-# NEXUS ALPHA | Multi-Strategy Portfolio Bot
+# NEXUS ALPHA | Overnight Drift Bot (production)
 #
-# Combines four retail-accessible edges, each documented in academic
-# literature or replicated by practitioners across multiple decades.
-# Risk parity allocation across strategies, vol-targeted sizing, hard
-# drawdown cutoff. Designed to compound, not to lottery.
+# Single-strategy first implementation. Strategy:
+#   - Submit BUY MOC (market-on-close) order on SPY ~3:55 PM ET
+#   - Submit SELL MOO (market-on-open) order at next session ~9:28 AM ET
+#   - Captures the SPX overnight risk premium (Bessembinder 2018,
+#     Lou et al 2019 — SPX has earned ~7%/yr overnight vs ~1%/yr intraday).
 #
-# STRATEGY 1: Overnight Drift (SPY)
-#   - Buy SPY at market close, sell at next open.
-#   - Edge: SPX has earned ~7%/yr overnight vs ~1%/yr intraday since 1993
-#     (Cliff Asness et al., Bessembinder 2018, NYU Stern overnight studies).
-#   - Mechanism: overnight risk premium, retail flow at open, no
-#     market makers willing to hold inventory over a closed session.
-#   - Sharpe historical: ~0.7
+# Why MOC/MOO instead of regular market orders:
+#   - Auction prints have no bid/ask spread cost
+#   - Better fills than crossing the spread at 3:59 PM
+#   - Standard practice for overnight-edge strategies
 #
-# STRATEGY 2: VRP Short Premium (SPY put credit spreads)
-#   - Sell 16-delta SPY puts, buy lower strike for cap, weekly expiry.
-#   - Only trade when VIX > median of last 252 days.
-#   - Edge: SPX IV > realized vol by ~3-4 vol points on average
-#     (Bollerslev, Tauchen, Zhou 2009; "Variance Risk Premium").
-#   - Sharpe historical: ~0.7-1.0 with tail risk
+# Risk controls:
+#   - Skip Fridays (3-day weekend gap has weaker / negative drift)
+#   - Skip day before market holidays (multi-day gap risk)
+#   - Position sized by leverage tier (1x conservative, 2x moderate, 3x aggressive)
+#   - Hard portfolio drawdown halt from high-water mark
+#   - State persisted to JSON so restarts don't double-enter or miss exits
 #
-# STRATEGY 3: Connors RSI(2) Mean Reversion (SPY)
-#   - Buy SPY when 2-period RSI < 5 and price > 200-day SMA.
-#   - Sell when 2-period RSI > 70 or after 5 trading days.
-#   - Edge: short-horizon mean reversion in indices, documented in
-#     Connors "Short Term Trading Strategies That Work" (2008).
-#   - Sharpe historical: ~0.5-0.8
+# The other three NEXUS ALPHA strategies (VRP, RSI(2), Sector Momentum)
+# remain in this file as scaffolding for future builds; they are NOT
+# wired into the production runner yet.
 #
-# STRATEGY 4: Sector Momentum Rotation
-#   - Universe: 9 SPDR sector ETFs (XLK XLF XLE XLV XLY XLP XLI XLU XLB).
-#   - Each month, rank by trailing 3-month total return.
-#   - Hold top 2 equal-weighted, rebalance monthly.
-#   - Edge: cross-sectional momentum, Jegadeesh & Titman 1993 and
-#     many replications across asset classes and decades.
-#   - Sharpe historical: ~0.6-0.9
-#
-# COMBINED: Diversification across uncorrelated edges produces a
-# portfolio Sharpe ~1.0-1.5, target 15-25% annual return with max
-# drawdown 10-15% on a typical year.
-#
-# NOTHING here promises 20-200% days. That's not how this works. What
-# this does is grind out steady returns most months and survive the
-# bad months without blowing up.
+# Usage:
+#   python nexus_alpha.py                       # paper mode, 1x leverage
+#   python nexus_alpha.py --leverage 2.0        # paper mode, 2x leverage
+#   python nexus_alpha.py --live                # live (paper-account) trading
+#   python nexus_alpha.py --reset-state         # clear persisted state
 # ====================================================================
 
 import os
 import sys
 import time
-import math
 import json
+import math
 import logging
 import argparse
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, date, time as dtime
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time as dtime
-from typing import Optional, Dict, List, Tuple
+from pathlib import Path
+from typing import Optional, Dict, List
 
 try:
     from dotenv import load_dotenv
@@ -72,21 +58,9 @@ try:
     ET = ZoneInfo("America/New_York")
 except ImportError:
     from datetime import timezone
+    # Naive EST fallback if zoneinfo unavailable
     ET = timezone(timedelta(hours=-5))
 
-# ====================================================================
-# LOGGING
-# ====================================================================
-os.makedirs("logs/alpha", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("logs/alpha/nexus_alpha.log", mode='a'),
-    ],
-)
-log = logging.getLogger("nexus.alpha")
 
 # ====================================================================
 # CONFIG
@@ -95,358 +69,478 @@ API_KEY = os.getenv("ALPACA_API_KEY", "")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-# Strategy allocation — risk parity targets (sum should be 1.0).
-# These get scaled by per-strategy vol to equalize risk contribution.
-STRATEGY_TARGET_RISK_WEIGHT = {
-    'overnight': 0.30,
-    'vrp':       0.25,
-    'rsi':       0.20,
-    'sector':    0.25,
-}
+LOG_DIR = Path("logs/alpha")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+STATE_PATH = LOG_DIR / "state.json"
+TRADES_CSV = LOG_DIR / "overnight_trades.csv"
 
-# Portfolio-level controls
-PORTFOLIO_VOL_TARGET = 0.12          # 12% annualized vol target
-MAX_PORTFOLIO_LEVERAGE = 1.5         # never more than 1.5x notional
-MAX_DRAWDOWN_HALT = 0.15             # hard stop at -15% from high-water mark
+# Strategy
+TICKER = "SPY"
+ASSET_ANNUAL_VOL = 0.18              # SPY ~18% annualized historically
+PORTFOLIO_VOL_TARGET = 0.12          # baseline 12% target (scaled by leverage)
+MAX_PORTFOLIO_DRAWDOWN = 0.15        # halt at -15% from HWM
+MOC_SUBMIT_TIME = dtime(15, 55)      # submit BUY MOC at/after 3:55 PM ET
+MOC_CUTOFF_TIME = dtime(15, 58)      # stop trying after 3:58 (Alpaca cutoff ~3:59)
+MOO_SUBMIT_TIME = dtime(9, 25)       # submit SELL MOO at/after 9:25 AM ET
+MOO_CUTOFF_TIME = dtime(9, 28)       # before 9:28 Alpaca cutoff
+SAFETY_FRIDAY_SKIP = True            # 3-day weekend gap is weaker edge
+SAFETY_PREHOLIDAY_SKIP = True        # avoid multi-day risk gaps
 
-# Per-strategy parameters
-SECTOR_UNIVERSE = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB"]
-SECTOR_LOOKBACK_DAYS = 63            # ~3 months
-SECTOR_HOLD_TOP_N = 2
-
-RSI_PERIOD = 2
-RSI_BUY_BELOW = 5
-RSI_SELL_ABOVE = 70
-RSI_MAX_HOLD_DAYS = 5
-
-VRP_PUT_DELTA = 0.16                 # ~1 SD OTM
-VRP_SPREAD_WIDTH = 5                 # dollars between short and long strike
-VRP_DTE_TARGET = 7                   # weekly expiry
-VRP_VIX_PERCENTILE_MIN = 0.50        # only sell when VIX > median
-VRP_DEFENSIVE_CLOSE_MULT = 2.0       # close if loss > 2x credit received
-
-OVERNIGHT_ENTRY_MINUTES_BEFORE_CLOSE = 15
-OVERNIGHT_EXIT_MINUTES_AFTER_OPEN = 5
+# Polling
+TICK_INTERVAL_SECONDS = 30           # plenty for daily-window strategy
 
 # ====================================================================
-# STRATEGY: OVERNIGHT DRIFT
+# LOGGING
+# ====================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "nexus_alpha.log", mode='a'),
+    ],
+)
+log = logging.getLogger("nexus.alpha")
+
+
+# ====================================================================
+# STATE — persisted across restarts
 # ====================================================================
 @dataclass
-class OvernightDriftStrategy:
-    """
-    Buy SPY at ~3:45 PM ET, sell at ~9:35 AM ET next session.
-    Captures the overnight risk premium.
-    """
-    name: str = "overnight"
-    ticker: str = "SPY"
+class PersistedState:
+    """Everything we need to know on restart to not double-trade or
+    miss an exit. Written to disk after every state-changing event."""
     position_open: bool = False
-    entry_price: float = 0.0
-    entry_time: Optional[datetime] = None
     shares: int = 0
-
-    def should_enter(self, now_et: datetime, market_open: bool) -> bool:
-        if self.position_open or not market_open:
-            return False
-        close_time = dtime(16, 0)
-        entry_window_start = dtime(15, 45)
-        return entry_window_start <= now_et.time() < close_time
-
-    def should_exit(self, now_et: datetime, market_open: bool) -> bool:
-        if not self.position_open or not market_open:
-            return False
-        exit_window_end = dtime(9, 45)
-        return dtime(9, 30) <= now_et.time() < exit_window_end
-
-# ====================================================================
-# STRATEGY: VRP SHORT PREMIUM
-# ====================================================================
-@dataclass
-class VRPStrategy:
-    """
-    Weekly SPY put credit spreads at ~16 delta, only when VIX in upper
-    half of trailing 252-day distribution. Defensive close at 2x credit.
-    """
-    name: str = "vrp"
-    open_spreads: List[dict] = field(default_factory=list)
-    vix_history: deque = field(default_factory=lambda: deque(maxlen=252))
-
-    def update_vix(self, vix: float):
-        self.vix_history.append(vix)
-
-    def vix_percentile(self, current_vix: float) -> float:
-        if len(self.vix_history) < 30:
-            return 0.5
-        below = sum(1 for v in self.vix_history if v < current_vix)
-        return below / len(self.vix_history)
-
-    def should_enter(self, now_et: datetime, current_vix: float,
-                     spy_price: float, market_open: bool) -> bool:
-        if not market_open or len(self.open_spreads) >= 2:
-            return False
-        # Enter on Mondays/Wednesdays at the open of cash session
-        if now_et.weekday() not in (0, 2):
-            return False
-        if not (dtime(9, 35) <= now_et.time() < dtime(10, 0)):
-            return False
-        return self.vix_percentile(current_vix) >= VRP_VIX_PERCENTILE_MIN
-
-    def check_defensive_close(self, spread: dict, current_loss: float) -> bool:
-        credit = spread.get('credit', 0)
-        return current_loss > credit * VRP_DEFENSIVE_CLOSE_MULT
-
-# ====================================================================
-# STRATEGY: RSI(2) MEAN REVERSION
-# ====================================================================
-@dataclass
-class RSI2Strategy:
-    """
-    Buy SPY when 2-period RSI < 5 AND price > 200-day SMA (trend filter).
-    Sell when RSI > 70 or after 5 trading days.
-    """
-    name: str = "rsi"
-    ticker: str = "SPY"
-    daily_closes: deque = field(default_factory=lambda: deque(maxlen=210))
-    position_open: bool = False
+    entry_order_id: str = ""
+    entry_submitted_date: str = ""   # ISO date string
     entry_price: float = 0.0
-    entry_day: int = 0
-    shares: int = 0
-    day_counter: int = 0
+    exit_order_id: str = ""
+    exit_submitted_date: str = ""
+    high_water_mark: float = 0.0
+    halted: bool = False
+    realised_pnl_total: float = 0.0
 
-    def update(self, close: float):
-        self.daily_closes.append(close)
-        self.day_counter += 1
+    @classmethod
+    def load(cls) -> "PersistedState":
+        if not STATE_PATH.exists():
+            return cls()
+        try:
+            return cls(**json.loads(STATE_PATH.read_text()))
+        except Exception as e:
+            log.warning(f"State file corrupt ({e}); starting fresh.")
+            return cls()
 
-    def rsi_2(self) -> float:
-        if len(self.daily_closes) < RSI_PERIOD + 1:
-            return 50.0
-        closes = list(self.daily_closes)[-(RSI_PERIOD + 1):]
-        gains = sum(max(closes[i+1] - closes[i], 0) for i in range(RSI_PERIOD))
-        losses = sum(max(closes[i] - closes[i+1], 0) for i in range(RSI_PERIOD))
-        if losses == 0:
-            return 100.0
-        rs = gains / losses
-        return 100.0 - (100.0 / (1.0 + rs))
+    def save(self):
+        STATE_PATH.write_text(json.dumps(asdict(self), indent=2))
 
-    def sma_200(self) -> float:
-        if len(self.daily_closes) < 200:
-            return 0.0
-        return sum(list(self.daily_closes)[-200:]) / 200.0
-
-    def should_enter(self, current_price: float) -> bool:
-        if self.position_open:
-            return False
-        sma = self.sma_200()
-        if sma == 0 or current_price < sma:
-            return False
-        return self.rsi_2() < RSI_BUY_BELOW
-
-    def should_exit(self, current_price: float) -> bool:
-        if not self.position_open:
-            return False
-        if self.rsi_2() > RSI_SELL_ABOVE:
-            return True
-        if (self.day_counter - self.entry_day) >= RSI_MAX_HOLD_DAYS:
-            return True
-        return False
 
 # ====================================================================
-# STRATEGY: SECTOR MOMENTUM ROTATION
+# HELPERS
 # ====================================================================
-@dataclass
-class SectorMomentumStrategy:
+def now_et() -> datetime:
+    return datetime.now(tz=ET)
+
+
+def is_friday(d: datetime) -> bool:
+    return d.weekday() == 4
+
+
+def shares_for_leverage(equity: float, price: float, leverage: float) -> int:
     """
-    Monthly rebalance: hold top N sector ETFs by trailing 3-month return.
+    Size = equity × (vol_target / asset_vol) × leverage / price.
+
+    On $50k, SPY $600, vol_target 12%, asset_vol 18%, leverage 2x:
+       size = 50000 × 0.667 × 2 / 600 = ~111 shares = ~$66.7k notional.
     """
-    name: str = "sector"
-    closes: Dict[str, deque] = field(
-        default_factory=lambda: {t: deque(maxlen=SECTOR_LOOKBACK_DAYS + 5)
-                                 for t in SECTOR_UNIVERSE}
-    )
-    current_holdings: Dict[str, int] = field(default_factory=dict)
-    last_rebalance_month: int = -1
+    if price <= 0 or equity <= 0:
+        return 0
+    notional = equity * (PORTFOLIO_VOL_TARGET / ASSET_ANNUAL_VOL) * leverage
+    return max(int(notional / price), 0)
 
-    def update_close(self, ticker: str, close: float):
-        if ticker in self.closes:
-            self.closes[ticker].append(close)
 
-    def trailing_return(self, ticker: str) -> Optional[float]:
-        c = self.closes.get(ticker)
-        if not c or len(c) < SECTOR_LOOKBACK_DAYS:
-            return None
-        prices = list(c)
-        return (prices[-1] / prices[-SECTOR_LOOKBACK_DAYS]) - 1.0
+def append_trade_csv(row: dict):
+    write_header = not TRADES_CSV.exists()
+    with open(TRADES_CSV, "a") as f:
+        if write_header:
+            f.write(",".join(row.keys()) + "\n")
+        f.write(",".join(str(v) for v in row.values()) + "\n")
 
-    def rank_sectors(self) -> List[Tuple[str, float]]:
-        ranked = []
-        for ticker in SECTOR_UNIVERSE:
-            ret = self.trailing_return(ticker)
-            if ret is not None:
-                ranked.append((ticker, ret))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        return ranked
-
-    def should_rebalance(self, now_et: datetime) -> bool:
-        return now_et.month != self.last_rebalance_month
-
-    def target_holdings(self) -> List[str]:
-        ranked = self.rank_sectors()
-        return [t for t, _ in ranked[:SECTOR_HOLD_TOP_N]]
 
 # ====================================================================
-# PORTFOLIO MANAGER
+# OVERNIGHT DRIFT BOT
 # ====================================================================
-class Portfolio:
-    """
-    Allocates capital across strategies by risk parity, enforces vol
-    target, and halts trading at max drawdown.
-    """
-
-    def __init__(self, starting_equity: float):
-        self.starting_equity = starting_equity
-        self.high_water_mark = starting_equity
-        self.equity = starting_equity
-        self.halted = False
-        # Risk allocation per strategy (dollars at risk)
-        self.strategy_allocations = self._compute_allocations(starting_equity)
-
-    def _compute_allocations(self, equity: float) -> Dict[str, float]:
-        """Risk parity: each strategy gets allocation × target_weight."""
-        deployable = equity * PORTFOLIO_VOL_TARGET / 0.18  # 18% asset vol
-        deployable = min(deployable, equity * MAX_PORTFOLIO_LEVERAGE)
-        return {name: deployable * w
-                for name, w in STRATEGY_TARGET_RISK_WEIGHT.items()}
-
-    def update_equity(self, new_equity: float):
-        self.equity = new_equity
-        if new_equity > self.high_water_mark:
-            self.high_water_mark = new_equity
-        drawdown = (self.high_water_mark - new_equity) / self.high_water_mark
-        if drawdown >= MAX_DRAWDOWN_HALT and not self.halted:
-            log.critical(f"DRAWDOWN HALT: -{drawdown*100:.1f}% from HWM. Halting.")
-            self.halted = True
-        # Recompute allocations on every equity move
-        self.strategy_allocations = self._compute_allocations(new_equity)
-
-    def can_trade(self) -> bool:
-        return not self.halted
-
-    def shares_for(self, strategy: str, price: float) -> int:
-        alloc = self.strategy_allocations.get(strategy, 0)
-        if price <= 0:
-            return 0
-        return int(alloc / price)
-
-# ====================================================================
-# RUNNER (skeleton — paper trading via Alpaca)
-# ====================================================================
-class NexusAlphaRunner:
-    def __init__(self, live: bool = False):
-        self.live = live
+class OvernightDriftBot:
+    def __init__(self, leverage: float, paper_sim: bool):
         if not API_KEY or not SECRET_KEY:
             log.error("Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env")
             sys.exit(1)
+        self.leverage = leverage
+        self.paper_sim = paper_sim  # True = no real orders, simulate fills
         self.api = REST(API_KEY, SECRET_KEY, BASE_URL)
-        try:
-            start_eq = float(self.api.get_account().equity)
-        except Exception:
-            start_eq = 50_000.0
-        self.portfolio = Portfolio(start_eq)
-        self.overnight = OvernightDriftStrategy()
-        self.vrp = VRPStrategy()
-        self.rsi = RSI2Strategy()
-        self.sector = SectorMomentumStrategy()
-        log.info(f"NEXUS ALPHA initialised, starting equity ${start_eq:,.2f}")
-        log.info(f"Allocations: {self.portfolio.strategy_allocations}")
+        self.state = PersistedState.load()
+        self.starting_equity = self._fetch_equity()
+        if self.state.high_water_mark == 0:
+            self.state.high_water_mark = self.starting_equity
+            self.state.save()
+        log.info("=" * 64)
+        log.info(f"  NEXUS ALPHA — Overnight Drift Bot")
+        log.info(f"  Mode: {'PAPER-SIM' if paper_sim else 'LIVE (paper account)'}  "
+                 f"Leverage: {leverage}x")
+        log.info(f"  Starting equity: ${self.starting_equity:,.2f}  "
+                 f"HWM: ${self.state.high_water_mark:,.2f}")
+        if self.state.position_open:
+            log.info(f"  RESUMING with open position: {self.state.shares} {TICKER} "
+                     f"@ ${self.state.entry_price:.2f}")
+        log.info("=" * 64)
+        self._holiday_cache: List[date] = []
+        self._holiday_cache_loaded_at: Optional[datetime] = None
 
-    def _is_market_open(self) -> bool:
+    # ----- Account helpers -----
+    def _fetch_equity(self) -> float:
         try:
-            return self.api.get_clock().is_open
-        except Exception:
-            return False
+            return float(self.api.get_account().equity)
+        except Exception as e:
+            log.warning(f"Equity fetch failed ({e}); using last HWM as proxy.")
+            return self.state.high_water_mark or 50_000.0
 
-    def _now_et(self) -> datetime:
-        return datetime.now(tz=ET)
-
-    def _get_price(self, ticker: str) -> float:
+    def _fetch_price(self) -> float:
         try:
-            quote = self.api.get_latest_quote(ticker)
+            quote = self.api.get_latest_quote(TICKER)
             bid = float(getattr(quote, 'bp', 0) or 0)
             ask = float(getattr(quote, 'ap', 0) or 0)
-            return (bid + ask) / 2 if bid and ask else 0.0
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
         except Exception as e:
-            log.debug(f"Quote fetch {ticker}: {e}")
-            return 0.0
+            log.debug(f"Quote fetch failed: {e}")
+        return 0.0
 
-    def _submit_market(self, ticker: str, qty: int, side: str):
-        if not self.live:
-            log.info(f"[PAPER-SIM] {side} {qty} {ticker}")
-            return None
+    def _is_trading_day(self, d: datetime) -> bool:
+        if d.weekday() >= 5:
+            return False
+        return d.date() not in self._upcoming_holidays()
+
+    def _upcoming_holidays(self) -> List[date]:
+        """Cache Alpaca's market calendar for the next ~60 days."""
+        if (self._holiday_cache_loaded_at and
+                (now_et() - self._holiday_cache_loaded_at).days < 7):
+            return self._holiday_cache
         try:
-            return self.api.submit_order(
-                symbol=ticker, qty=qty, side=side,
-                type='market', time_in_force='day',
+            today = now_et().date()
+            end = today + timedelta(days=60)
+            cal = self.api.get_calendar(
+                start=today.isoformat(), end=end.isoformat()
             )
+            trading_days = {entry.date.date() if hasattr(entry.date, 'date')
+                            else entry.date for entry in cal}
+            self._holiday_cache = [
+                today + timedelta(days=i)
+                for i in range(60)
+                if (today + timedelta(days=i)).weekday() < 5
+                and (today + timedelta(days=i)) not in trading_days
+            ]
+            self._holiday_cache_loaded_at = now_et()
+            log.info(f"Cached {len(self._holiday_cache)} upcoming market closures.")
         except Exception as e:
-            log.error(f"Order failed {side} {qty} {ticker}: {e}")
-            return None
+            log.warning(f"Calendar fetch failed ({e}); proceeding without "
+                        f"holiday awareness.")
+            self._holiday_cache = []
+        return self._holiday_cache
 
-    def tick(self):
-        if self.portfolio.halted:
+    def _is_pre_holiday(self, d: datetime) -> bool:
+        """True if next trading day is more than 1 calendar day away."""
+        tomorrow = d.date() + timedelta(days=1)
+        # If tomorrow is weekend or holiday, this is a multi-day gap entry
+        check = tomorrow
+        days_until_open = 1
+        while days_until_open <= 5:
+            if check.weekday() < 5 and check not in self._upcoming_holidays():
+                break
+            check += timedelta(days=1)
+            days_until_open += 1
+        return days_until_open > 1
+
+    # ----- Entry / exit guards -----
+    def _can_enter_today(self, d: datetime) -> tuple[bool, str]:
+        if self.state.halted:
+            return False, "halted (drawdown)"
+        if self.state.position_open:
+            return False, "position already open"
+        if not self._is_trading_day(d):
+            return False, "not a trading day"
+        if SAFETY_FRIDAY_SKIP and is_friday(d):
+            return False, "friday skip (3-day weekend gap)"
+        if SAFETY_PREHOLIDAY_SKIP and self._is_pre_holiday(d):
+            return False, "pre-holiday skip (multi-day gap)"
+        return True, ""
+
+    # ----- Reconciliation -----
+    def _reconcile(self):
+        """Compare persisted state to actual Alpaca positions; fix drift."""
+        if self.paper_sim:
             return
         try:
-            equity = float(self.api.get_account().equity)
-            self.portfolio.update_equity(equity)
-        except Exception:
-            pass
+            positions = {p.symbol: float(p.qty) for p in self.api.list_positions()}
+        except Exception as e:
+            log.warning(f"Position reconcile failed: {e}")
+            return
+        actual_qty = int(positions.get(TICKER, 0))
+        if self.state.position_open and actual_qty == 0:
+            log.warning(f"State said position open ({self.state.shares} sh) but "
+                        f"broker shows none. Clearing state.")
+            self._clear_position_state()
+        elif not self.state.position_open and actual_qty > 0:
+            log.warning(f"Broker shows {actual_qty} sh but state says flat. "
+                        f"Adopting broker truth.")
+            self.state.position_open = True
+            self.state.shares = actual_qty
+            self.state.save()
 
-        now_et = self._now_et()
-        market_open = self._is_market_open()
+    # ----- Order submission -----
+    def _submit_moc_buy(self, qty: int) -> Optional[str]:
+        """Market-on-close BUY. Returns order id, or None on failure."""
+        if self.paper_sim:
+            sim_id = f"paper-moc-{int(time.time())}"
+            log.info(f"[PAPER-SIM] BUY MOC {qty} {TICKER} (order {sim_id})")
+            return sim_id
+        try:
+            order = self.api.submit_order(
+                symbol=TICKER, qty=qty, side='buy',
+                type='market', time_in_force='cls',
+            )
+            log.info(f"BUY MOC submitted: {qty} {TICKER} (order {order.id})")
+            return order.id
+        except Exception as e:
+            log.error(f"BUY MOC failed: {e}")
+            return None
 
-        # --- Overnight Drift ---
-        if self.overnight.should_enter(now_et, market_open):
-            price = self._get_price("SPY")
-            if price > 0:
-                qty = self.portfolio.shares_for('overnight', price)
-                if qty > 0:
-                    self._submit_market("SPY", qty, "buy")
-                    self.overnight.position_open = True
-                    self.overnight.entry_price = price
-                    self.overnight.entry_time = now_et
-                    self.overnight.shares = qty
-                    log.info(f"OVERNIGHT ENTER: +{qty} SPY @ ${price:.2f}")
-        elif self.overnight.should_exit(now_et, market_open):
-            self._submit_market("SPY", self.overnight.shares, "sell")
-            exit_price = self._get_price("SPY")
-            pnl = (exit_price - self.overnight.entry_price) * self.overnight.shares
-            log.info(f"OVERNIGHT EXIT: -{self.overnight.shares} SPY @ ${exit_price:.2f} "
-                     f"PnL ${pnl:+.2f}")
-            self.overnight.position_open = False
-            self.overnight.shares = 0
+    def _submit_moo_sell(self, qty: int) -> Optional[str]:
+        """Market-on-open SELL. Returns order id, or None on failure."""
+        if self.paper_sim:
+            sim_id = f"paper-moo-{int(time.time())}"
+            log.info(f"[PAPER-SIM] SELL MOO {qty} {TICKER} (order {sim_id})")
+            return sim_id
+        try:
+            order = self.api.submit_order(
+                symbol=TICKER, qty=qty, side='sell',
+                type='market', time_in_force='opg',
+            )
+            log.info(f"SELL MOO submitted: {qty} {TICKER} (order {order.id})")
+            return order.id
+        except Exception as e:
+            log.error(f"SELL MOO failed: {e}")
+            return None
 
-        # --- RSI(2) Mean Reversion ---
-        # Update on first tick of session (would normally use daily bars)
-        # For brevity, the daily-bar feed is left to the runner caller.
+    def _check_fill(self, order_id: str) -> Optional[float]:
+        """Return filled_avg_price if filled, else None."""
+        if self.paper_sim or not order_id:
+            return None
+        try:
+            o = self.api.get_order(order_id)
+            if o.status == 'filled' and o.filled_avg_price:
+                return float(o.filled_avg_price)
+        except Exception as e:
+            log.debug(f"Order status check {order_id}: {e}")
+        return None
 
-        # --- VRP and Sector Rotation ---
-        # These require options chain and multi-ticker quote infra that
-        # belongs in dedicated polling threads. Skeleton left for clarity;
-        # full implementation in sibling modules.
+    # ----- State management -----
+    def _clear_position_state(self):
+        self.state.position_open = False
+        self.state.shares = 0
+        self.state.entry_order_id = ""
+        self.state.entry_submitted_date = ""
+        self.state.entry_price = 0.0
+        self.state.exit_order_id = ""
+        self.state.exit_submitted_date = ""
+        self.state.save()
 
-    def run_forever(self):
-        log.info(f"Running {'LIVE' if self.live else 'PAPER'}. Ctrl-C to stop.")
+    # ----- Drawdown halt -----
+    def _check_drawdown(self, equity: float):
+        if equity > self.state.high_water_mark:
+            self.state.high_water_mark = equity
+            self.state.save()
+        dd = (self.state.high_water_mark - equity) / self.state.high_water_mark \
+            if self.state.high_water_mark > 0 else 0
+        if dd >= MAX_PORTFOLIO_DRAWDOWN and not self.state.halted:
+            log.critical(f"DRAWDOWN HALT: equity ${equity:,.2f} is "
+                         f"{dd*100:.1f}% below HWM ${self.state.high_water_mark:,.2f}. "
+                         f"No new entries until --reset-state.")
+            self.state.halted = True
+            self.state.save()
+
+    # ----- Main tick -----
+    def tick(self):
+        equity = self._fetch_equity()
+        self._check_drawdown(equity)
+        self._reconcile()
+
+        d = now_et()
+        t = d.time()
+
+        # ENTRY WINDOW
+        if MOC_SUBMIT_TIME <= t < MOC_CUTOFF_TIME:
+            today_iso = d.date().isoformat()
+            if self.state.entry_submitted_date == today_iso:
+                return  # already submitted today
+            allowed, reason = self._can_enter_today(d)
+            if not allowed:
+                if self.state.entry_submitted_date != today_iso:
+                    log.info(f"Entry skipped: {reason}")
+                    self.state.entry_submitted_date = today_iso  # cool-off
+                    self.state.save()
+                return
+            price = self._fetch_price()
+            if price <= 0:
+                log.warning("No price quote; cannot size entry.")
+                return
+            qty = shares_for_leverage(equity, price, self.leverage)
+            if qty <= 0:
+                log.warning(f"Size = 0 shares (equity ${equity:.0f}, "
+                            f"price ${price:.2f}). Skipping.")
+                return
+            order_id = self._submit_moc_buy(qty)
+            if order_id:
+                self.state.entry_order_id = order_id
+                self.state.entry_submitted_date = today_iso
+                self.state.shares = qty
+                self.state.entry_price = price  # approximate; reconciled at fill
+                self.state.position_open = True
+                self.state.save()
+
+        # EXIT WINDOW
+        elif MOO_SUBMIT_TIME <= t < MOO_CUTOFF_TIME:
+            if not self.state.position_open:
+                return
+            today_iso = d.date().isoformat()
+            if self.state.exit_submitted_date == today_iso:
+                return  # already submitted today
+            order_id = self._submit_moo_sell(self.state.shares)
+            if order_id:
+                self.state.exit_order_id = order_id
+                self.state.exit_submitted_date = today_iso
+                self.state.save()
+
+        # MISSED-EXIT RECOVERY: if we have an open position from a prior
+        # session and the MOO window passed without an order, flatten at
+        # market on the next trading-day tick. Holding extra nights drifts
+        # from the documented edge (overnight ≠ multi-night).
+        elif (self.state.position_open and
+              not self.state.exit_order_id and
+              self._is_trading_day(d) and
+              MOO_CUTOFF_TIME <= t < MOC_SUBMIT_TIME):
+            log.warning(f"MISSED EXIT WINDOW — flattening {self.state.shares} "
+                        f"{TICKER} at market to stay true to strategy intent.")
+            if self.paper_sim:
+                fallback_id = f"paper-rescue-{int(time.time())}"
+            else:
+                try:
+                    o = self.api.submit_order(
+                        symbol=TICKER, qty=self.state.shares, side='sell',
+                        type='market', time_in_force='day',
+                    )
+                    fallback_id = o.id
+                except Exception as e:
+                    log.error(f"Rescue sell failed: {e}")
+                    return
+            self.state.exit_order_id = fallback_id
+            self.state.exit_submitted_date = d.date().isoformat()
+            self.state.save()
+
+        # POST-EXIT: record PnL once the exit fill is known. order_id is
+        # cleared in _clear_position_state, preventing repeat recordings.
+        elif self.state.exit_order_id and self.state.position_open:
+            exit_price = self._check_fill(self.state.exit_order_id)
+            if self.paper_sim:
+                # Simulate the exit fill at the current bid/ask midpoint
+                exit_price = self._fetch_price() or self.state.entry_price
+            if exit_price:
+                pnl = (exit_price - self.state.entry_price) * self.state.shares
+                self.state.realised_pnl_total += pnl
+                row = {
+                    "entry_date": (self.state.entry_submitted_date or "?"),
+                    "exit_date": self.state.exit_submitted_date,
+                    "shares": self.state.shares,
+                    "entry_price": f"{self.state.entry_price:.4f}",
+                    "exit_price": f"{exit_price:.4f}",
+                    "pnl": f"{pnl:.2f}",
+                    "leverage": self.leverage,
+                    "mode": "paper-sim" if self.paper_sim else "live",
+                }
+                append_trade_csv(row)
+                log.info(f"ROUND-TRIP COMPLETE: {self.state.shares} {TICKER}  "
+                         f"entry ${self.state.entry_price:.2f} → "
+                         f"exit ${exit_price:.2f}  PnL ${pnl:+,.2f}  "
+                         f"(total realised ${self.state.realised_pnl_total:+,.2f})")
+                self._clear_position_state()
+
+    def run(self):
         try:
             while True:
                 self.tick()
-                time.sleep(30)
+                time.sleep(TICK_INTERVAL_SECONDS)
         except KeyboardInterrupt:
-            log.info("Shutting down.")
+            log.info("Shutdown requested. Persisting state and exiting.")
+            self.state.save()
+            self._print_summary()
+            sys.exit(0)
 
+    def _print_summary(self):
+        print()
+        print("=" * 64)
+        print(f"  NEXUS ALPHA SESSION SUMMARY")
+        print("=" * 64)
+        equity = self._fetch_equity()
+        print(f"  Starting equity:    ${self.starting_equity:,.2f}")
+        print(f"  Current equity:     ${equity:,.2f}")
+        print(f"  Net change:         ${equity - self.starting_equity:+,.2f}")
+        print(f"  High-water mark:    ${self.state.high_water_mark:,.2f}")
+        print(f"  Realised PnL (cum): ${self.state.realised_pnl_total:+,.2f}")
+        print(f"  Halted:             {self.state.halted}")
+        if self.state.position_open:
+            print(f"  Open position:      {self.state.shares} {TICKER} @ "
+                  f"${self.state.entry_price:.2f}")
+        print(f"  Trade log:          {TRADES_CSV}")
+        print("=" * 64)
+
+
+# ====================================================================
+# OTHER STRATEGY SCAFFOLDS (kept for future expansion, not wired in)
+# ====================================================================
+# VRPStrategy, RSI2Strategy, SectorMomentumStrategy from the earlier
+# draft are deliberately omitted from this production build. They will
+# return as their own focused implementations once Overnight Drift has
+# logged 30+ days of paper trades with PnL matching expectations.
+
+
+# ====================================================================
+# CLI
+# ====================================================================
 def main():
-    p = argparse.ArgumentParser(description="NEXUS ALPHA — Multi-strategy bot")
-    p.add_argument("--live", action="store_true")
-    args = p.parse_args()
-    runner = NexusAlphaRunner(live=args.live)
-    runner.run_forever()
+    parser = argparse.ArgumentParser(
+        description="NEXUS ALPHA — Overnight Drift Bot",
+    )
+    parser.add_argument("--live", action="store_true",
+                        help="Submit real orders to the Alpaca paper account "
+                             "(default: simulate fills locally, no orders sent)")
+    parser.add_argument("--leverage", type=float, default=1.0,
+                        choices=[1.0, 2.0, 3.0],
+                        help="Position size leverage tier (default: 1.0)")
+    parser.add_argument("--reset-state", action="store_true",
+                        help="Clear persisted state (including drawdown halt) "
+                             "and exit")
+    args = parser.parse_args()
+
+    if args.reset_state:
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+            print(f"Cleared state file: {STATE_PATH}")
+        else:
+            print("No state file to clear.")
+        sys.exit(0)
+
+    bot = OvernightDriftBot(leverage=args.leverage, paper_sim=not args.live)
+    bot.run()
+
 
 if __name__ == "__main__":
     main()
