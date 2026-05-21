@@ -1,0 +1,28 @@
+# Core
+anthropic>=0.40.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+prompt-toolkit>=3.0.0
+requests>=2.31.0
+duckduckgo-search>=6.0.0
+
+# Vision
+pillow>=10.0.0
+mss>=9.0.0
+
+# API server
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# Scheduler
+schedule>=1.2.0
+
+# Notifications
+plyer>=2.1.0
+
+# Optional: Voice (comment out if not using)
+# edge-tts>=6.1.0
+# faster-whisper>=1.0.0
+# sounddevice>=0.4.6
+# soundfile>=0.12.1
+# numpy>=1.26.0
